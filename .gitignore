@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+
+# macOS
+.DS_Store
+
+# Token & secrets (VERY important)
+client_secret.json
+*.json
+!requirements.txt  # keep your deps file
