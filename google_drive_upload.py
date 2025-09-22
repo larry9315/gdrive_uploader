@@ -8,18 +8,23 @@ Standalone CLI to upload a local file to Google Drive at an optional destination
 - If a file with the same name exists, uploads an additional copy.
 """
 
+
 from __future__ import annotations
 
+# --- Standard library ---
 import argparse
 import json
 import os
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 
+# --- Google client libraries ---
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload          # for file uploads
+from googleapiclient.errors import HttpError
 
 # ---------- Constants ----------
 APP_NAME = "google_drive_upload"
@@ -145,6 +150,123 @@ def build_drive(creds: Credentials):
     # cache_discovery=False avoids writing to ~/.cache
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
+
+#---- This block of code is all about figuring out where in Google Drive your file should be uploaded — and making sure that path exists ---
+def normalize_segments(destination_path: str | None) -> List[str]:
+    if not destination_path:
+        return []
+    return [seg for seg in destination_path.strip("/").split("/") if seg]
+
+def _escape_single_quotes(s: str) -> str:
+    # Drive query values are wrapped in single quotes; escape embedded single quotes
+    return s.replace("'", r"\'")
+
+def _pick_oldest(files: List[dict]) -> dict | None:
+    if not files:
+        return None
+    return sorted(files, key=lambda f: f.get("createdTime", ""))[0]
+
+def find_child_folder(
+    drive,
+    parent_id: str,
+    name: str,
+    shared_drive_id: str | None,
+    verbose: bool,
+) -> dict | None:
+    q = (
+        f"name = '{_escape_single_quotes(name)}' and "
+        f"mimeType = 'application/vnd.google-apps.folder' and "
+        f"'{parent_id}' in parents and trashed = false"
+    )
+    params = {
+        "q": q,
+        "fields": "files(id,name,createdTime)",
+        "pageSize": 100,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "spaces": "drive",
+    }
+    # corpora: search within the user’s My Drive or a specific Shared Drive
+    if shared_drive_id:
+        params.update({"corpora": "drive", "driveId": shared_drive_id})
+    else:
+        params.update({"corpora": "user"})
+
+    if verbose:
+        eprint(f"[debug] search child: parent={parent_id} name='{name}'")
+    resp = drive.files().list(**params).execute()
+    files = resp.get("files", [])
+    if len(files) > 1 and verbose:
+        eprint(f"[warn] Duplicate folders named '{name}' under parent {parent_id}; choosing oldest.")
+    return _pick_oldest(files)
+
+def create_child_folder(
+    drive,
+    parent_id: str,
+    name: str,
+    verbose: bool,
+) -> dict:
+    if verbose:
+        eprint(f"[info] create folder: '{name}' under {parent_id}")
+    body = {
+        "name": name,
+        "mimeType": "application/vnd.google-apps.folder",
+        "parents": [parent_id],
+    }
+    return drive.files().create(
+        body=body,
+        fields="id,name,createdTime",
+        supportsAllDrives=True,
+    ).execute()
+
+def resolve_parent_folder_id(
+    drive,
+    destination_path: str | None,
+    shared_drive_id: str | None,
+    verbose: bool,
+    dry_run: bool,
+) -> str:
+    """
+    Returns the target parent folder ID where the file should be uploaded.
+    Uses Shared Drive root if --shared-drive is set; otherwise My Drive root.
+    Creates only missing path segments (unless --dry-run).
+    """
+    current_parent = shared_drive_id if shared_drive_id else "root"
+
+    # Once we discover the first missing segment in dry-run,
+    # we stop querying Drive and just simulate creation for the rest.
+    simulate_chain = False
+
+    for seg in normalize_segments(destination_path):
+        if dry_run and simulate_chain:
+            # We already know the remainder doesn't exist; just simulate
+            if verbose:
+                eprint(f"[dry-run] would create folder '{seg}' under {current_parent}")
+            current_parent = f"dryrun_{seg}"
+            continue
+
+        # Try to reuse an existing folder (only real query when not simulating)
+        existing = find_child_folder(drive, current_parent, seg, shared_drive_id, verbose)
+
+        if existing:
+            current_parent = existing["id"]
+            if verbose:
+                eprint(f"[info] reuse: /{seg} -> {current_parent}")
+            continue
+
+        # Missing segment
+        if dry_run:
+            if verbose:
+                eprint(f"[dry-run] would create folder '{seg}' under {current_parent}")
+            current_parent = f"dryrun_{seg}"
+            simulate_chain = True  # from now on, don't hit the API
+        else:
+            created = create_child_folder(drive, current_parent, seg, verbose)
+            current_parent = created["id"]
+
+    return current_parent
+
+
 # ---------- CLI ----------
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -158,6 +280,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--auth-port", type=int, default=0, help="Loopback port for OAuth (0 = auto). Use a fixed port (e.g., 8080) when tunneling via SSH.")
     p.add_argument("--verbose", action="store_true", help="Verbose logging.")
     p.add_argument("--auth-only", action="store_true", help="Authenticate and print the signed-in email, then exit.")
+    p.add_argument("--shared-drive", help="Shared Drive ID to use as root (optional).")
+    p.add_argument("--dry-run", action="store_true", help="Show the plan (reuse/create) without making changes.")
     return p.parse_args()
 
 # ---------- Main ----------
@@ -188,8 +312,30 @@ def main():
     if args.auth_only:
         return  # stop here for auth-only runs
 
-    # Placeholder for upcoming steps (path resolution + upload)
-    print(f"[debug] Auth OK. Next: would upload '{src}' to '{args.destination_path or '/'}'")
+    # Resolve destination folder (reusing existing segments; create only missing ones)
+    try:
+        parent_id = resolve_parent_folder_id(
+            drive=drive,
+            destination_path=args.destination_path,
+            shared_drive_id=args.shared_drive,
+            verbose=args.verbose,
+            dry_run=args.dry_run,
+        )
+    except HttpError as ex:
+        code = getattr(ex.resp, "status", None)
+        if code and int(code) == 403:
+            eprint("[error] Permission denied resolving destination (403). Check folder access or Shared Drive membership.")
+            sys.exit(5)
+        eprint(f"[error] Failed to resolve destination path: {ex}")
+        sys.exit(6)
+
+    if args.dry_run:
+        eprint("[dry-run] Resolution complete.")
+        eprint(f"[dry-run] Would upload '{src}' to parent folder id: {parent_id}")
+        return
+
+    # Only runs if not dry-run
+    print(f"[debug] Destination resolved. Parent folder id: {parent_id}")
 
 if __name__ == "__main__":
     try:
