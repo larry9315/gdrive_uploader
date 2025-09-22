@@ -21,17 +21,20 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 
+# ---------- Constants ----------
 APP_NAME = "google_drive_upload"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 DEFAULT_LABEL = "default"
 CONFIG_DIR = Path.home() / ".config" / "google_drive_upload" / "tokens"
 
+# ---------- Logging ----------
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
 # This function is about locking the door on a file or folder so only you (the owner) can use it.
 # 0o600 = private file (read/write for you only).
 # 0o700 = private folder (full access for you only).
+# ---------- FS helpers ----------
 def ensure_secure_path(path: Path, is_file: bool):
     try:
         os.chmod(path, 0o600 if is_file else 0o700)
@@ -50,6 +53,7 @@ def token_path_for_label(label: str) -> Path:
     return CONFIG_DIR / f"{label}.json"
 
 # finds and validates the Google OAuth client secrets JSON file.
+# ---------- Client secrets ----------
 def load_client_config(client_secrets_path: Optional[str]) -> dict:
     path = client_secrets_path or os.environ.get("GOOGLE_CLIENT_SECRETS")
     if not path:
@@ -66,6 +70,7 @@ def load_client_config(client_secrets_path: Optional[str]) -> dict:
         eprint(f"[error] Failed to read client secrets JSON: {ex}")
         sys.exit(4)
 
+# ---------- Token cache ----------
 def save_credentials(creds: Credentials, label: str):
     path = token_path_for_label(label)
     data = {
@@ -98,19 +103,86 @@ def load_cached_credentials(label: str) -> Optional[Credentials]:
     except Exception:
         return None
 
-def main():
-    parser = argparse.ArgumentParser(
+
+# ---------- OAuth + Drive client ----------
+def get_credentials(client_config: dict, label: str, headless: bool, verbose: bool) -> Credentials:
+    cached = load_cached_credentials(label)
+    if cached and cached.valid:
+        if verbose:
+            eprint("[info] Using cached credentials.")
+        return cached
+
+    if verbose:
+        eprint("[info] Starting OAuth flow...")
+
+    flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
+
+    if headless:
+        # Console flow: prints URL + code; perfect for SSH/headless
+        creds = flow.run_console(prompt="consent")
+    else:
+        # Try local browser loopback; fall back to console if it fails
+        try:
+            creds = flow.run_local_server(host="127.0.0.1", port=0, prompt="consent", open_browser=True)
+        except Exception as ex:
+            eprint(f"[warn] Local server flow failed ({ex}); falling back to console.")
+            creds = flow.run_console(prompt="consent")
+
+    save_credentials(creds, label)
+    return creds
+
+def build_drive(creds: Credentials):
+    # cache_discovery=False avoids writing to ~/.cache
+    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+# ---------- CLI ----------
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
         description="Upload a local file to Google Drive at an optional destination path."
     )
-    parser.add_argument("--source-file", required=True, help="Path to the local file to upload")
-    parser.add_argument("--destination-path", help="Destination path on Google Drive (e.g., /Work/Reports/2025)")
-    parser.add_argument("--client-secrets", default="client_secret.json", help="Path to OAuth2 client secret JSON file")
+    p.add_argument("--source-file", required=True, help="Path to the local file to upload")
+    p.add_argument("--destination-path", help="Destination path on Google Drive (e.g., /Work/Reports/2025)")
+    p.add_argument("--client-secrets", help="Path to OAuth 2.0 client JSON (Desktop app). If not provided, uses env GOOGLE_CLIENT_SECRETS.")
+    p.add_argument("--account-label", default=DEFAULT_LABEL, help="Token cache label for switching accounts.")
+    p.add_argument("--headless", action="store_true", help="Use console (copy/paste) OAuth flow; good for SSH.")
+    p.add_argument("--verbose", action="store_true", help="Verbose logging.")
+    p.add_argument("--auth-only", action="store_true", help="Authenticate and print the signed-in email, then exit.")
+    return p.parse_args()
 
-    args = parser.parse_args()
+# ---------- Main ----------
+def main():
+    args = parse_args()
 
-    # TODO: implement authentication, path resolution, and upload
-    print(f"[debug] Would upload '{args.source_file}' to '{args.destination_path or '/'}'")
+    # Match final CLI contract by validating source path even though we don't upload yet.
+    src = Path(args.source_file)
+    if not src.exists() or not src.is_file():
+        eprint(f"[error] Source file not found or not a file: {src}")
+        sys.exit(3)
+
+    client_config = load_client_config(args.client_secrets)
+    creds = get_credentials(client_config, args.account_label, args.headless, args.verbose)
+
+    # Prove auth works by calling Drive 'about'
+    try:
+        drive = build_drive(creds)
+        about = drive.about().get(fields="user(emailAddress,displayName)").execute()
+        user = about.get("user", {})
+        email = user.get("emailAddress", "<unknown>")
+        name = user.get("displayName", "")
+        print(f"Authenticated as: {name} <{email}>")
+    except Exception as ex:
+        eprint(f"[error] Failed to query Drive API: {ex}")
+        sys.exit(4)
+
+    if args.auth_only:
+        return  # stop here in Step 2
+
+    # Placeholder for upcoming steps (path resolution + upload)
+    print(f"[debug] Auth OK. Next: would upload '{src}' to '{args.destination_path or '/'}'")
 
 if __name__ == "__main__":
-    main()
-
+    try:
+        main()
+    except KeyboardInterrupt:
+        eprint("\n[info] Aborted by user.")
+        sys.exit(130)
