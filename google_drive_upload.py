@@ -105,7 +105,13 @@ def load_cached_credentials(label: str) -> Optional[Credentials]:
 
 
 # ---------- OAuth + Drive client ----------
-def get_credentials(client_config: dict, label: str, headless: bool, verbose: bool) -> Credentials:
+def get_credentials(client_config: dict, label: str, headless: bool, verbose: bool, auth_port: int) -> Credentials:
+    """Obtain Google credentials, reusing cache when valid.
+
+    Uses the supported loopback flow (run_local_server). In headless mode we do
+    not auto-open a browser. For remote/headless auth, use SSH port-forwarding
+    and a fixed --auth-port (e.g., 8080), then open the printed URL locally.
+    """
     cached = load_cached_credentials(label)
     if cached and cached.valid:
         if verbose:
@@ -117,19 +123,23 @@ def get_credentials(client_config: dict, label: str, headless: bool, verbose: bo
 
     flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
 
-    if headless:
-        # Console flow: prints URL + code; perfect for SSH/headless
-        creds = flow.run_console(prompt="consent")
-    else:
-        # Try local browser loopback; fall back to console if it fails
-        try:
-            creds = flow.run_local_server(host="127.0.0.1", port=0, prompt="consent", open_browser=True)
-        except Exception as ex:
-            eprint(f"[warn] Local server flow failed ({ex}); falling back to console.")
-            creds = flow.run_console(prompt="consent")
+    try:
+        creds = flow.run_local_server(
+            host="127.0.0.1",
+            port=auth_port,            # 0 = pick a free port; use a fixed port when tunneling
+            prompt="consent",
+            open_browser=not headless, # headless -> print URL instead of opening browser
+        )
+    except Exception as ex:
+        eprint(f"[error] OAuth loopback flow failed: {ex}")
+        eprint("[hint] If this is a remote/headless machine, try SSH port-forwarding, e.g.:")
+        eprint("       ssh -L 8080:127.0.0.1:8080 <user>@<server>")
+        eprint("       then re-run with: --headless --auth-port 8080")
+        raise
 
     save_credentials(creds, label)
     return creds
+
 
 def build_drive(creds: Credentials):
     # cache_discovery=False avoids writing to ~/.cache
@@ -144,7 +154,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--destination-path", help="Destination path on Google Drive (e.g., /Work/Reports/2025)")
     p.add_argument("--client-secrets", help="Path to OAuth 2.0 client JSON (Desktop app). If not provided, uses env GOOGLE_CLIENT_SECRETS.")
     p.add_argument("--account-label", default=DEFAULT_LABEL, help="Token cache label for switching accounts.")
-    p.add_argument("--headless", action="store_true", help="Use console (copy/paste) OAuth flow; good for SSH.")
+    p.add_argument("--headless", action="store_true", help="Don't auto-open a browser; print the auth URL instead.")
+    p.add_argument("--auth-port", type=int, default=0, help="Loopback port for OAuth (0 = auto). Use a fixed port (e.g., 8080) when tunneling via SSH.")
     p.add_argument("--verbose", action="store_true", help="Verbose logging.")
     p.add_argument("--auth-only", action="store_true", help="Authenticate and print the signed-in email, then exit.")
     return p.parse_args()
@@ -153,14 +164,14 @@ def parse_args() -> argparse.Namespace:
 def main():
     args = parse_args()
 
-    # Match final CLI contract by validating source path even though we don't upload yet.
+    # Validate source path early (even for --auth-only we keep the contract simple).
     src = Path(args.source_file)
     if not src.exists() or not src.is_file():
         eprint(f"[error] Source file not found or not a file: {src}")
         sys.exit(3)
 
     client_config = load_client_config(args.client_secrets)
-    creds = get_credentials(client_config, args.account_label, args.headless, args.verbose)
+    creds = get_credentials(client_config, args.account_label, args.headless, args.verbose, args.auth_port)
 
     # Prove auth works by calling Drive 'about'
     try:
@@ -175,7 +186,7 @@ def main():
         sys.exit(4)
 
     if args.auth_only:
-        return  # stop here in Step 2
+        return  # stop here for auth-only runs
 
     # Placeholder for upcoming steps (path resolution + upload)
     print(f"[debug] Auth OK. Next: would upload '{src}' to '{args.destination_path or '/'}'")
