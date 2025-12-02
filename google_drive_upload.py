@@ -8,7 +8,7 @@ Standalone CLI to upload a local file to Google Drive at an optional destination
 
 Features:
 - Reuses existing subfolders and creates only missing ones.
-- Supports My Drive and Shared Drives.
+- Operates on the user's My Drive.
 - If a file with the same name exists at the destination, uploads an additional copy
   by auto-renaming it with a numeric suffix: "name (1).ext", "name (2).ext", etc.
 """
@@ -180,7 +180,6 @@ def find_child_folder(
     drive,
     parent_id: str,
     name: str,
-    shared_drive_id: str | None,
     verbose: bool,
 ) -> dict | None:
     q = (
@@ -195,11 +194,8 @@ def find_child_folder(
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
         "spaces": "drive",
+        "corpora": "user",
     }
-    if shared_drive_id:
-        params.update({"corpora": "drive", "driveId": shared_drive_id})
-    else:
-        params.update({"corpora": "user"})
 
     if verbose:
         eprint(f"[debug] search child: parent={parent_id} name='{name}'")
@@ -233,19 +229,18 @@ def create_child_folder(
 def resolve_parent_folder_id(
     drive,
     destination_path: str | None,
-    shared_drive_id: str | None,
     verbose: bool,
     dry_run: bool,
 ) -> str:
     """
     Returns the target parent folder ID where the file should be uploaded.
-    Uses Shared Drive root if --shared-drive is set; otherwise My Drive root.
+    Uses My Drive root as the starting point.
     Reuses existing segments and creates only missing folders (unless --dry-run).
     """
-    current_parent = shared_drive_id if shared_drive_id else "root"
+    current_parent = "root"
 
     for seg in normalize_segments(destination_path):
-        existing = find_child_folder(drive, current_parent, seg, shared_drive_id, verbose)
+        existing = find_child_folder(drive, current_parent, seg, verbose)
         if existing:
             current_parent = existing["id"]
             if verbose:
@@ -264,9 +259,7 @@ def resolve_parent_folder_id(
 
 
 # ---------- Upload helpers ----------
-def infer_mime(path: Path, override: Optional[str]) -> Optional[str]:
-    if override:
-        return override
+def infer_mime(path: Path) -> Optional[str]:
     mime, _ = mimetypes.guess_type(str(path))
     return mime
 
@@ -308,13 +301,12 @@ def upload_file(
     source_path: Path,
     upload_name: str,
     mime_type: Optional[str],
-    chunk_mb: int,
     verbose: bool,
 ) -> tuple[str, Optional[str]]:
     media = MediaFileUpload(
         str(source_path),
         mimetype=mime_type,
-        chunksize=max(1, chunk_mb) * 1024 * 1024,
+        chunksize=DEFAULT_CHUNK_MB * 1024 * 1024,
         resumable=True,
     )
     metadata = {
@@ -337,7 +329,6 @@ def compute_upload_name(
     drive,
     parent_id: str,
     original_name: str,
-    shared_drive_id: str | None,
     verbose: bool,
 ) -> str:
     """
@@ -359,11 +350,8 @@ def compute_upload_name(
         "supportsAllDrives": True,
         "includeItemsFromAllDrives": True,
         "spaces": "drive",
+        "corpora": "user",
     }
-    if shared_drive_id:
-        params.update({"corpora": "drive", "driveId": shared_drive_id})
-    else:
-        params.update({"corpora": "user"})
 
     if verbose:
         eprint(f"[debug] listing existing names in parent {parent_id} to compute duplicate suffix")
@@ -422,12 +410,8 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Loopback port for OAuth (0 = auto). Use a fixed port (e.g., 8080) when tunneling via SSH.",
     )
-    p.add_argument("--shared-drive", help="Shared Drive ID to use as root (optional).")
-    p.add_argument("--mime-type", help="Override MIME type (otherwise inferred).")
-    p.add_argument("--chunk-size-mb", type=int, default=DEFAULT_CHUNK_MB, help="Resumable upload chunk size in MB.")
     p.add_argument("--dry-run", action="store_true", help="Show the plan (reuse/create) without making changes.")
     p.add_argument("--verbose", action="store_true", help="Verbose logging.")
-    p.add_argument("--auth-only", action="store_true", help="Authenticate and print the signed-in email, then exit.")
     return p.parse_args()
 
 
@@ -463,24 +447,18 @@ def main():
         eprint(f"[error] Failed to query Drive API: {ex}")
         sys.exit(4)
 
-    if args.auth_only:
-        # Print user info to stdout for auth-only runs
-        print(f"Authenticated as: {name} <{email}>")
-        return
-
     # Resolve destination folder
     try:
         parent_id = resolve_parent_folder_id(
             drive=drive,
             destination_path=args.destination_path,
-            shared_drive_id=args.shared_drive,
             verbose=args.verbose,
             dry_run=args.dry_run,
         )
     except HttpError as ex:
         code = getattr(ex.resp, "status", None)
         if code and int(code) == 403:
-            eprint("[error] Permission denied resolving destination (403). Check folder access or Shared Drive membership.")
+            eprint("[error] Permission denied resolving destination (403). Check folder access.")
             sys.exit(5)
         eprint(f"[error] Failed to resolve destination path: {ex}")
         sys.exit(6)
@@ -496,7 +474,6 @@ def main():
             drive=drive,
             parent_id=parent_id,
             original_name=src.name,
-            shared_drive_id=args.shared_drive,
             verbose=args.verbose,
         )
     except HttpError as ex:
@@ -511,7 +488,7 @@ def main():
         eprint(f"[info] Final upload name: {upload_name}")
 
     # ---- Upload ----
-    mime = infer_mime(src, args.mime_type)
+    mime = infer_mime(src)
 
     try:
         file_id, web_view = upload_file(
@@ -520,7 +497,6 @@ def main():
             source_path=src,
             upload_name=upload_name,
             mime_type=mime,
-            chunk_mb=args.chunk_size_mb,
             verbose=args.verbose,
         )
     except HttpError as ex:
@@ -533,6 +509,9 @@ def main():
     except Exception as ex:
         eprint(f"[error] Upload failed: {ex}")
         sys.exit(6)
+
+    # Success: print JSON to stdout
+    print(json.dumps({"file_id": file_id, "webViewLink": web_view}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
