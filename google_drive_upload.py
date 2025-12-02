@@ -510,8 +510,6 @@ def main():
         eprint(f"[error] Upload failed: {ex}")
         sys.exit(6)
 
-    # Success: print JSON to stdout
-    print(json.dumps({"file_id": file_id, "webViewLink": web_view}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
