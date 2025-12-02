@@ -1,29 +1,31 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 
 """
 google_drive_upload.py
 
 Standalone CLI to upload a local file to Google Drive at an optional destination path.
+
+Features:
 - Reuses existing subfolders and creates only missing ones.
-- If a file with the same name exists, uploads an additional copy.
+- Supports My Drive and Shared Drives.
+- If a file with the same name exists at the destination, uploads an additional copy
+  by auto-renaming it with a numeric suffix: "name (1).ext", "name (2).ext", etc.
 """
 
-
-from __future__ import annotations
-
-# --- Standard library ---
 import argparse
 import json
+import mimetypes
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Optional, List
 
-# --- Google client libraries ---
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
-from googleapiclient.http import MediaFileUpload          # for file uploads
+from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 # ---------- Constants ----------
@@ -31,33 +33,36 @@ APP_NAME = "google_drive_upload"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 DEFAULT_LABEL = "default"
 CONFIG_DIR = Path.home() / ".config" / "google_drive_upload" / "tokens"
+DEFAULT_CHUNK_MB = 32
+MAX_RETRIES = 5
+
 
 # ---------- Logging ----------
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
 
-# This function is about locking the door on a file or folder so only you (the owner) can use it.
-# 0o600 = private file (read/write for you only).
-# 0o700 = private folder (full access for you only).
+
 # ---------- FS helpers ----------
 def ensure_secure_path(path: Path, is_file: bool):
+    """Lock down permissions: dir 700, file 600."""
     try:
         os.chmod(path, 0o600 if is_file else 0o700)
     except PermissionError:
+        # Non-fatal on some filesystems
         pass
 
-# This function makes a private, safe folder in your home directory for storing Google Drive authentication tokens, then hands you back the path to it.
+
 def ensure_config_dir() -> Path:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     ensure_secure_path(CONFIG_DIR, is_file=False)
     return CONFIG_DIR
 
-# Make sure the secure token folder exists, then give me the full path to the token file for this label.
+
 def token_path_for_label(label: str) -> Path:
     ensure_config_dir()
     return CONFIG_DIR / f"{label}.json"
 
-# finds and validates the Google OAuth client secrets JSON file.
+
 # ---------- Client secrets ----------
 def load_client_config(client_secrets_path: Optional[str]) -> dict:
     path = client_secrets_path or os.environ.get("GOOGLE_CLIENT_SECRETS")
@@ -75,6 +80,7 @@ def load_client_config(client_secrets_path: Optional[str]) -> dict:
         eprint(f"[error] Failed to read client secrets JSON: {ex}")
         sys.exit(4)
 
+
 # ---------- Token cache ----------
 def save_credentials(creds: Credentials, label: str):
     path = token_path_for_label(label)
@@ -89,6 +95,7 @@ def save_credentials(creds: Credentials, label: str):
     with path.open("w", encoding="utf-8") as f:
         json.dump(data, f)
     ensure_secure_path(path, is_file=True)
+
 
 def load_cached_credentials(label: str) -> Optional[Credentials]:
     path = token_path_for_label(label)
@@ -110,13 +117,14 @@ def load_cached_credentials(label: str) -> Optional[Credentials]:
 
 
 # ---------- OAuth + Drive client ----------
-def get_credentials(client_config: dict, label: str, headless: bool, verbose: bool, auth_port: int) -> Credentials:
-    """Obtain Google credentials, reusing cache when valid.
-
-    Uses the supported loopback flow (run_local_server). In headless mode we do
-    not auto-open a browser. For remote/headless auth, use SSH port-forwarding
-    and a fixed --auth-port (e.g., 8080), then open the printed URL locally.
-    """
+def get_credentials(
+    client_config: dict,
+    label: str,
+    headless: bool,
+    verbose: bool,
+    auth_port: int,
+) -> Credentials:
+    """Obtain Google credentials, reusing cache when valid."""
     cached = load_cached_credentials(label)
     if cached and cached.valid:
         if verbose:
@@ -131,40 +139,42 @@ def get_credentials(client_config: dict, label: str, headless: bool, verbose: bo
     try:
         creds = flow.run_local_server(
             host="127.0.0.1",
-            port=auth_port,            # 0 = pick a free port; use a fixed port when tunneling
+            port=auth_port,            # 0 = pick a free port
             prompt="consent",
-            open_browser=not headless, # headless -> print URL instead of opening browser
+            open_browser=not headless, # headless -> print URL instead of auto-open
         )
     except Exception as ex:
         eprint(f"[error] OAuth loopback flow failed: {ex}")
         eprint("[hint] If this is a remote/headless machine, try SSH port-forwarding, e.g.:")
         eprint("       ssh -L 8080:127.0.0.1:8080 <user>@<server>")
         eprint("       then re-run with: --headless --auth-port 8080")
-        raise
+        sys.exit(4)
 
     save_credentials(creds, label)
     return creds
 
 
 def build_drive(creds: Credentials):
-    # cache_discovery=False avoids writing to ~/.cache
+    # cache_discovery=False avoids writing discovery cache under ~/.cache
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
-#---- This block of code is all about figuring out where in Google Drive your file should be uploaded — and making sure that path exists ---
+# ---------- Path resolution ----------
 def normalize_segments(destination_path: str | None) -> List[str]:
     if not destination_path:
         return []
     return [seg for seg in destination_path.strip("/").split("/") if seg]
 
+
 def _escape_single_quotes(s: str) -> str:
-    # Drive query values are wrapped in single quotes; escape embedded single quotes
     return s.replace("'", r"\'")
+
 
 def _pick_oldest(files: List[dict]) -> dict | None:
     if not files:
         return None
     return sorted(files, key=lambda f: f.get("createdTime", ""))[0]
+
 
 def find_child_folder(
     drive,
@@ -186,7 +196,6 @@ def find_child_folder(
         "includeItemsFromAllDrives": True,
         "spaces": "drive",
     }
-    # corpora: search within the user’s My Drive or a specific Shared Drive
     if shared_drive_id:
         params.update({"corpora": "drive", "driveId": shared_drive_id})
     else:
@@ -199,6 +208,7 @@ def find_child_folder(
     if len(files) > 1 and verbose:
         eprint(f"[warn] Duplicate folders named '{name}' under parent {parent_id}; choosing oldest.")
     return _pick_oldest(files)
+
 
 def create_child_folder(
     drive,
@@ -219,6 +229,7 @@ def create_child_folder(
         supportsAllDrives=True,
     ).execute()
 
+
 def resolve_parent_folder_id(
     drive,
     destination_path: str | None,
@@ -229,42 +240,167 @@ def resolve_parent_folder_id(
     """
     Returns the target parent folder ID where the file should be uploaded.
     Uses Shared Drive root if --shared-drive is set; otherwise My Drive root.
-    Creates only missing path segments (unless --dry-run).
+    Reuses existing segments and creates only missing folders (unless --dry-run).
     """
     current_parent = shared_drive_id if shared_drive_id else "root"
 
-    # Once we discover the first missing segment in dry-run,
-    # we stop querying Drive and just simulate creation for the rest.
-    simulate_chain = False
-
     for seg in normalize_segments(destination_path):
-        if dry_run and simulate_chain:
-            # We already know the remainder doesn't exist; just simulate
-            if verbose:
-                eprint(f"[dry-run] would create folder '{seg}' under {current_parent}")
-            current_parent = f"dryrun_{seg}"
-            continue
-
-        # Try to reuse an existing folder (only real query when not simulating)
         existing = find_child_folder(drive, current_parent, seg, shared_drive_id, verbose)
-
         if existing:
             current_parent = existing["id"]
             if verbose:
                 eprint(f"[info] reuse: /{seg} -> {current_parent}")
             continue
 
-        # Missing segment
         if dry_run:
             if verbose:
                 eprint(f"[dry-run] would create folder '{seg}' under {current_parent}")
             current_parent = f"dryrun_{seg}"
-            simulate_chain = True  # from now on, don't hit the API
         else:
             created = create_child_folder(drive, current_parent, seg, verbose)
             current_parent = created["id"]
 
     return current_parent
+
+
+# ---------- Upload helpers ----------
+def infer_mime(path: Path, override: Optional[str]) -> Optional[str]:
+    if override:
+        return override
+    mime, _ = mimetypes.guess_type(str(path))
+    return mime
+
+
+def upload_with_retries(request, verbose: bool) -> dict:
+    """Drive resumable upload with retry on transient errors."""
+    attempt = 0
+    response = None
+    while True:
+        try:
+            status, response = request.next_chunk()
+            if status and verbose:
+                pct = int(status.progress() * 100)
+                eprint(f"[progress] {pct}%")
+            if response is not None:
+                return response
+        except HttpError as err:
+            code = getattr(err, "status_code", None) or getattr(err.resp, "status", None)
+            if code and int(code) in (429, 500, 502, 503, 504) and attempt < MAX_RETRIES:
+                attempt += 1
+                backoff = min(2 ** attempt, 32)
+                eprint(f"[warn] transient HTTP {code}; retrying in {backoff}s (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(backoff)
+                continue
+            raise
+        except Exception as ex:
+            if attempt < MAX_RETRIES:
+                attempt += 1
+                backoff = min(2 ** attempt, 32)
+                eprint(f"[warn] upload error: {ex}; retrying in {backoff}s (attempt {attempt}/{MAX_RETRIES})")
+                time.sleep(backoff)
+                continue
+            raise
+
+
+def upload_file(
+    drive,
+    parent_id: str,
+    source_path: Path,
+    upload_name: str,
+    mime_type: Optional[str],
+    chunk_mb: int,
+    verbose: bool,
+) -> tuple[str, Optional[str]]:
+    media = MediaFileUpload(
+        str(source_path),
+        mimetype=mime_type,
+        chunksize=max(1, chunk_mb) * 1024 * 1024,
+        resumable=True,
+    )
+    metadata = {
+        "name": upload_name,
+        "parents": [parent_id],
+    }
+    request = drive.files().create(
+        body=metadata,
+        media_body=media,
+        fields="id,webViewLink",
+        supportsAllDrives=True,
+    )
+    resp = upload_with_retries(request, verbose)
+    file_id = resp.get("id")
+    web_view = resp.get("webViewLink")
+    return file_id, web_view
+
+
+def compute_upload_name(
+    drive,
+    parent_id: str,
+    original_name: str,
+    shared_drive_id: str | None,
+    verbose: bool,
+) -> str:
+    """
+    Compute a non-conflicting name in the target folder.
+
+    If 'file.txt' does not exist -> 'file.txt'
+    If 'file.txt' exists        -> 'file (1).txt'
+    If 'file (1).txt' exists    -> 'file (2).txt'
+    etc.
+    """
+    stem, ext = os.path.splitext(original_name)
+
+    # List all items in this folder and examine their names
+    q = f"'{parent_id}' in parents and trashed = false"
+    params = {
+        "q": q,
+        "fields": "files(id,name,createdTime)",
+        "pageSize": 1000,
+        "supportsAllDrives": True,
+        "includeItemsFromAllDrives": True,
+        "spaces": "drive",
+    }
+    if shared_drive_id:
+        params.update({"corpora": "drive", "driveId": shared_drive_id})
+    else:
+        params.update({"corpora": "user"})
+
+    if verbose:
+        eprint(f"[debug] listing existing names in parent {parent_id} to compute duplicate suffix")
+
+    resp = drive.files().list(**params).execute()
+    files = resp.get("files", [])
+
+    existing_names = {f["name"] for f in files}
+
+    # If plain name doesn't exist at all, just use it.
+    if original_name not in existing_names:
+        return original_name
+
+    # Collect indices for patterns like: "<stem> (N)<ext>"
+    used_indices = {0}  # 0 represents original_name
+    for name in existing_names:
+        if not name.startswith(stem):
+            continue
+        prefix = f"{stem} ("
+        suffix = f"){ext}"
+        if name.startswith(prefix) and name.endswith(suffix):
+            middle = name[len(prefix) : -len(suffix)]
+            try:
+                n = int(middle)
+                used_indices.add(n)
+            except ValueError:
+                continue
+
+    # Find the smallest non-negative integer not used yet
+    n = 1
+    while n in used_indices:
+        n += 1
+
+    candidate = f"{stem} ({n}){ext}"
+    if verbose:
+        eprint(f"[info] Duplicate name detected; using '{candidate}'")
+    return candidate
 
 
 # ---------- CLI ----------
@@ -274,45 +410,65 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--source-file", required=True, help="Path to the local file to upload")
     p.add_argument("--destination-path", help="Destination path on Google Drive (e.g., /Work/Reports/2025)")
-    p.add_argument("--client-secrets", help="Path to OAuth 2.0 client JSON (Desktop app). If not provided, uses env GOOGLE_CLIENT_SECRETS.")
+    p.add_argument(
+        "--client-secrets",
+        help="Path to OAuth 2.0 client JSON (Desktop app). If not provided, uses env GOOGLE_CLIENT_SECRETS.",
+    )
     p.add_argument("--account-label", default=DEFAULT_LABEL, help="Token cache label for switching accounts.")
     p.add_argument("--headless", action="store_true", help="Don't auto-open a browser; print the auth URL instead.")
-    p.add_argument("--auth-port", type=int, default=0, help="Loopback port for OAuth (0 = auto). Use a fixed port (e.g., 8080) when tunneling via SSH.")
+    p.add_argument(
+        "--auth-port",
+        type=int,
+        default=0,
+        help="Loopback port for OAuth (0 = auto). Use a fixed port (e.g., 8080) when tunneling via SSH.",
+    )
+    p.add_argument("--shared-drive", help="Shared Drive ID to use as root (optional).")
+    p.add_argument("--mime-type", help="Override MIME type (otherwise inferred).")
+    p.add_argument("--chunk-size-mb", type=int, default=DEFAULT_CHUNK_MB, help="Resumable upload chunk size in MB.")
+    p.add_argument("--dry-run", action="store_true", help="Show the plan (reuse/create) without making changes.")
     p.add_argument("--verbose", action="store_true", help="Verbose logging.")
     p.add_argument("--auth-only", action="store_true", help="Authenticate and print the signed-in email, then exit.")
-    p.add_argument("--shared-drive", help="Shared Drive ID to use as root (optional).")
-    p.add_argument("--dry-run", action="store_true", help="Show the plan (reuse/create) without making changes.")
     return p.parse_args()
+
 
 # ---------- Main ----------
 def main():
     args = parse_args()
 
-    # Validate source path early (even for --auth-only we keep the contract simple).
+    # Validate source path early.
     src = Path(args.source_file)
     if not src.exists() or not src.is_file():
         eprint(f"[error] Source file not found or not a file: {src}")
         sys.exit(3)
 
     client_config = load_client_config(args.client_secrets)
-    creds = get_credentials(client_config, args.account_label, args.headless, args.verbose, args.auth_port)
+    creds = get_credentials(
+        client_config,
+        label=args.account_label,
+        headless=args.headless,
+        verbose=args.verbose,
+        auth_port=args.auth_port,
+    )
 
-    # Prove auth works by calling Drive 'about'
+    # Prove auth works & build Drive client
     try:
         drive = build_drive(creds)
         about = drive.about().get(fields="user(emailAddress,displayName)").execute()
         user = about.get("user", {})
         email = user.get("emailAddress", "<unknown>")
         name = user.get("displayName", "")
-        print(f"Authenticated as: {name} <{email}>")
+        if args.verbose:
+            eprint(f"[info] Authenticated as: {name} <{email}>")
     except Exception as ex:
         eprint(f"[error] Failed to query Drive API: {ex}")
         sys.exit(4)
 
     if args.auth_only:
-        return  # stop here for auth-only runs
+        # Print user info to stdout for auth-only runs
+        print(f"Authenticated as: {name} <{email}>")
+        return
 
-    # Resolve destination folder (reusing existing segments; create only missing ones)
+    # Resolve destination folder
     try:
         parent_id = resolve_parent_folder_id(
             drive=drive,
@@ -334,8 +490,50 @@ def main():
         eprint(f"[dry-run] Would upload '{src}' to parent folder id: {parent_id}")
         return
 
-    # Only runs if not dry-run
-    print(f"[debug] Destination resolved. Parent folder id: {parent_id}")
+    # Compute final upload name that avoids conflicts by adding (1), (2), ...
+    try:
+        upload_name = compute_upload_name(
+            drive=drive,
+            parent_id=parent_id,
+            original_name=src.name,
+            shared_drive_id=args.shared_drive,
+            verbose=args.verbose,
+        )
+    except HttpError as ex:
+        code = getattr(ex.resp, "status", None)
+        if code and int(code) == 403:
+            eprint("[error] Permission denied listing folder contents (403).")
+            sys.exit(5)
+        eprint(f"[error] Failed to compute upload name: {ex}")
+        sys.exit(6)
+
+    if args.verbose:
+        eprint(f"[info] Final upload name: {upload_name}")
+
+    # ---- Upload ----
+    mime = infer_mime(src, args.mime_type)
+
+    try:
+        file_id, web_view = upload_file(
+            drive=drive,
+            parent_id=parent_id,
+            source_path=src,
+            upload_name=upload_name,
+            mime_type=mime,
+            chunk_mb=args.chunk_size_mb,
+            verbose=args.verbose,
+        )
+    except HttpError as ex:
+        code = getattr(ex.resp, "status", None)
+        if code and int(code) == 403:
+            eprint("[error] Permission denied uploading (403). Check write access to the destination.")
+            sys.exit(5)
+        eprint(f"[error] Upload failed: {ex}")
+        sys.exit(6)
+    except Exception as ex:
+        eprint(f"[error] Upload failed: {ex}")
+        sys.exit(6)
+
 
 if __name__ == "__main__":
     try:
