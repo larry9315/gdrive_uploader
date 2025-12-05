@@ -29,7 +29,6 @@ from googleapiclient.http import MediaFileUpload
 from googleapiclient.errors import HttpError
 
 # ---------- Constants ----------
-APP_NAME = "google_drive_upload"
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 DEFAULT_LABEL = "default"
 CONFIG_DIR = Path.home() / ".config" / "google_drive_upload" / "tokens"
@@ -191,10 +190,10 @@ def find_child_folder(
         "q": q,
         "fields": "files(id,name,createdTime)",
         "pageSize": 100,
-        "supportsAllDrives": True,
-        "includeItemsFromAllDrives": True,
-        "spaces": "drive",
         "corpora": "user",
+        "spaces": "drive",
+        "supportsAllDrives": False,
+        "includeItemsFromAllDrives": False,
     }
 
     if verbose:
@@ -222,7 +221,7 @@ def create_child_folder(
     return drive.files().create(
         body=body,
         fields="id,name,createdTime",
-        supportsAllDrives=True,
+        supportsAllDrives=False,
     ).execute()
 
 
@@ -317,7 +316,7 @@ def upload_file(
         body=metadata,
         media_body=media,
         fields="id,webViewLink",
-        supportsAllDrives=True,
+        supportsAllDrives=False,
     )
     resp = upload_with_retries(request, verbose)
     file_id = resp.get("id")
@@ -347,10 +346,10 @@ def compute_upload_name(
         "q": q,
         "fields": "files(id,name,createdTime)",
         "pageSize": 1000,
-        "supportsAllDrives": True,
-        "includeItemsFromAllDrives": True,
-        "spaces": "drive",
         "corpora": "user",
+        "spaces": "drive",
+        "supportsAllDrives": False,
+        "includeItemsFromAllDrives": False,
     }
 
     if verbose:
@@ -509,7 +508,6 @@ def main():
     except Exception as ex:
         eprint(f"[error] Upload failed: {ex}")
         sys.exit(6)
-
 
 
 if __name__ == "__main__":
